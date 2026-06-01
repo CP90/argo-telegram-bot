@@ -36,7 +36,7 @@ def run_web_server():
 # =========================
 TOKEN = os.environ["TOKEN"]
 UPDATE_INTERVAL_SECONDS = 60
-MARKET_CACHE_SECONDS = 60
+MARKET_CACHE_SECONDS = 300
 
 SYM_SPY = "spy.us"
 SYM_VIX = "^vix"
@@ -183,7 +183,7 @@ def stooq_quote(symbol: str) -> Dict[str, float]:
     params = {"s": symbol, "f": "sd2t2ohlcv", "h": "", "e": "csv"}
 
     try:
-        r = SESSION.get(url, params=params, headers=HEADERS, timeout=(10, 20))
+        r = SESSION.get(url, params=params, headers=HEADERS, timeout=(30, 60))
         r.raise_for_status()
     except requests.exceptions.RequestException as e:
         print(f"❌ Errore Stooq quote [{symbol}] -> {e}")
@@ -216,7 +216,7 @@ def stooq_history(symbol: str, days: int = 5) -> list:
     params = {"s": symbol, "i": "d"}
 
     try:
-        r = SESSION.get(url, params=params, headers=HEADERS, timeout=(10, 20))
+        r = SESSION.get(url, params=params, headers=HEADERS, timeout=(30, 60))
         r.raise_for_status()
     except requests.exceptions.RequestException as e:
         print(f"❌ Errore Stooq history [{symbol}] -> {e}")
@@ -251,7 +251,6 @@ def fetch_market_snapshot() -> Dict[str, Any]:
 
     now_dt = italy_now()
 
-    # cache breve per evitare troppe richieste a Stooq
     if _market_cache["ts"] and _market_cache["data"]:
         age = (now_dt - _market_cache["ts"]).total_seconds()
         if age < MARKET_CACHE_SECONDS:
@@ -259,10 +258,17 @@ def fetch_market_snapshot() -> Dict[str, Any]:
 
     now_str = now_dt.strftime("%Y-%m-%d %H:%M:%S")
 
+    # SPY quote: fondamentale
     spy = stooq_quote(SYM_SPY)
-    spy_hist = stooq_history(SYM_SPY, days=5)
 
-    # VIX: se fallisce, prova a non rompere tutto
+    # History: se fallisce, fallback
+    try:
+        spy_hist = stooq_history(SYM_SPY, days=5)
+    except Exception as e:
+        print(f"⚠️ History SPY non disponibile -> {e}")
+        spy_hist = []
+
+    # VIX: se fallisce, fallback
     try:
         vix_data = stooq_quote(SYM_VIX)
         vix = vix_data.get("close") or 18.0
@@ -306,6 +312,7 @@ def fetch_market_snapshot() -> Dict[str, Any]:
 
     _market_cache = {"ts": now_dt, "data": result}
     return result
+
 
 # =========================
 # LOGICA ARGO
