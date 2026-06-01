@@ -50,12 +50,11 @@ def run_web_server():
 TOKEN = os.environ["TOKEN"]
 TWELVEDATA_API_KEY = os.environ["TWELVEDATA_API_KEY"]
 
-# 5 minuti per stare tranquilli lato crediti/consumo
+# 5 minuti: più sostenibile lato API
 UPDATE_INTERVAL_SECONDS = 300
 MARKET_CACHE_SECONDS = 300
 
 SYM_SPY = "SPY"
-SYM_VIX = "VIX"   # Se non va col tuo piano/account, il codice usa fallback automatico
 
 ITALY_TZ = ZoneInfo("Europe/Rome")
 NY_TZ = ZoneInfo("America/New_York")
@@ -88,6 +87,7 @@ HEADERS = {
 # =========================
 _macro_cache: Dict[str, Any] = {"date": None, "events": []}
 _market_cache: Dict[str, Any] = {"ts": None, "data": None}
+_vix_cache: Dict[str, Any] = {"ts": None, "value": None}
 
 
 # =========================
@@ -211,12 +211,9 @@ def format_events_list() -> str:
 
 
 # =========================
-# TWELVEDATA
+# TWELVEDATA (SPY)
 # =========================
 def td_get(endpoint: str, params: dict) -> dict:
-    """
-    Chiamata generica a TwelveData con auth via header Authorization: apikey ...
-    """
     headers = dict(HEADERS)
     headers["Authorization"] = f"apikey {TWELVEDATA_API_KEY}"
 
@@ -292,6 +289,56 @@ def td_history(symbol: str, outputsize: int = 5) -> list:
 
 
 # =========================
+# YAHOO FINANCE (VIX SPOT)
+# =========================
+def get_vix_spot(force_refresh: bool = False) -> float:
+    """
+    Legge il vero VIX spot da Yahoo Finance (^VIX).
+    Tiene una piccola cache per evitare richieste inutili ravvicinate.
+    """
+    global _vix_cache
+
+    now_dt = italy_now()
+    if not force_refresh and _vix_cache["ts"] and _vix_cache["value"] is not None:
+        age = (now_dt - _vix_cache["ts"]).total_seconds()
+        if age < MARKET_CACHE_SECONDS:
+            return float(_vix_cache["value"])
+
+    url = "https://query1.finance.yahoo.com/v7/finance/quote"
+    params = {"symbols": "^VIX"}
+
+    headers = dict(HEADERS)
+    headers["User-Agent"] = "Mozilla/5.0"
+
+    try:
+        r = SESSION.get(url, params=params, headers=headers, timeout=(10, 20))
+        r.raise_for_status()
+        data = r.json()
+    except requests.exceptions.RequestException as e:
+        logger.exception("❌ Errore rete Yahoo VIX: %s", e)
+        raise RuntimeError(f"Errore rete Yahoo Finance VIX: {e}")
+
+    try:
+        result = data["quoteResponse"]["result"]
+        if not result:
+            raise RuntimeError("Risposta Yahoo vuota per ^VIX")
+
+        quote = result[0]
+        price = quote.get("regularMarketPrice")
+
+        if price in (None, "", "N/A"):
+            raise RuntimeError("Prezzo VIX non disponibile su Yahoo")
+
+        value = float(price)
+        _vix_cache = {"ts": now_dt, "value": value}
+        return value
+
+    except Exception as e:
+        logger.exception("❌ Errore parsing Yahoo VIX: %s", e)
+        raise RuntimeError(f"Errore parsing Yahoo Finance VIX: {e}")
+
+
+# =========================
 # SNAPSHOT MERCATO
 # =========================
 def fetch_market_snapshot() -> Dict[str, Any]:
@@ -312,11 +359,11 @@ def fetch_market_snapshot() -> Dict[str, Any]:
         logger.warning("⚠️ Storico SPY non disponibile -> %s", e)
         spy_hist = []
 
-    # Se VIX non è disponibile, non blocchiamo tutto
+    # VIX spot vero da Yahoo Finance
     try:
-        vix = td_quote(SYM_VIX).get("close") or 18.0
+        vix = get_vix_spot()
     except Exception as e:
-        logger.warning("⚠️ VIX non disponibile, uso fallback 18.0 -> %s", e)
+        logger.warning("⚠️ VIX Yahoo non disponibile, uso fallback 18.0 -> %s", e)
         vix = 18.0
 
     price = spy.get("close")
@@ -645,6 +692,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/briefing — analisi completa + eventi macro\n"
         "/postit   — livelli chiave\n"
         "/eventi   — calendario macro del giorno\n"
+        "/vix      — solo VIX spot\n"
         "/watchon  — alert automatici ON\n"
         "/watchoff — alert automatici OFF\n"
         "/ping     — test rapido"
@@ -654,6 +702,21 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info("📩 /ping ricevuto da chat_id=%s", update.effective_chat.id)
     await update.message.reply_text("pong 🟢")
+
+
+async def vix(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("⏳ Recupero VIX…")
+    try:
+        price = await asyncio.to_thread(get_vix_spot, True)
+        now_str = italy_now().strftime("%Y-%m-%d %H:%M:%S")
+        await update.message.reply_text(
+            f"📈 VIX SPOT\n\n"
+            f"Valore: {price:.2f}\n"
+            f"Aggiornato: {now_str}"
+        )
+    except Exception as e:
+        logger.exception("❌ Errore /vix: %s", e)
+        await update.message.reply_text(f"❌ Errore VIX: {e}")
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -726,7 +789,6 @@ async def market_job(context: ContextTypes.DEFAULT_TYPE):
         if not app.bot_data.get("watch_chats"):
             return
 
-        # Evita consumo crediti quando il mercato è chiuso
         if not is_us_market_open_now():
             return
 
@@ -804,6 +866,7 @@ def main():
     handlers = [
         ("start", start),
         ("ping", ping),
+        ("vix", vix),
         ("status", status),
         ("briefing", briefing),
         ("postit", postit),
