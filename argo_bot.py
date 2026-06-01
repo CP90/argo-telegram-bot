@@ -2,12 +2,31 @@ import asyncio
 import csv
 import io
 import os
+import threading
+from flask import Flask
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, Optional
 
 import requests
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+
+# =========================
+# MINI SERVER HTTP PER RENDER
+# =========================
+web_app = Flask(__name__)
+
+@web_app.get("/")
+def home():
+    return "ARGO bot is running", 200
+
+@web_app.get("/health")
+def health():
+    return "ok", 200
+
+def run_web_server():
+    port = int(os.environ.get("PORT", 10000))
+    web_app.run(host="0.0.0.0", port=port)
 
 # =========================
 # CONFIGURAZIONE
@@ -561,6 +580,8 @@ def main():
         ("watchoff", watchoff),
     ]:
         app.add_handler(CommandHandler(cmd, fn))
+
+    threading.Thread(target=run_web_server, daemon=True).start()
 
     print("🤖 Bot ARGO partito…")
     app.run_polling(poll_interval=1.0, timeout=30)
