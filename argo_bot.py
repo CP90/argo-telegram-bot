@@ -1,47 +1,64 @@
 import asyncio
-import csv
-import io
+import logging
 import os
 import threading
-from datetime import datetime, timedelta
-from typing import Dict, Any, Optional
+from datetime import datetime, time
+from typing import Any, Dict, Optional
 from zoneinfo import ZoneInfo
 
 import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 from flask import Flask
+from requests.adapters import HTTPAdapter
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from urllib3.util.retry import Retry
+
+# =========================
+# LOGGING
+# =========================
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logger = logging.getLogger(__name__)
 
 # =========================
 # MINI SERVER HTTP PER RENDER
 # =========================
 web_app = Flask(__name__)
 
+
 @web_app.get("/")
 def home():
     return "ARGO bot is running", 200
+
 
 @web_app.get("/health")
 def health():
     return "ok", 200
 
+
 def run_web_server():
     port = int(os.environ.get("PORT", 10000))
     web_app.run(host="0.0.0.0", port=port)
+
 
 # =========================
 # CONFIGURAZIONE
 # =========================
 TOKEN = os.environ["TOKEN"]
-UPDATE_INTERVAL_SECONDS = 60
+TWELVEDATA_API_KEY = os.environ["TWELVEDATA_API_KEY"]
+
+# 5 minuti per stare tranquilli lato crediti/consumo
+UPDATE_INTERVAL_SECONDS = 300
 MARKET_CACHE_SECONDS = 300
 
-SYM_SPY = "spy.us"
-SYM_VIX = "^vix"
+SYM_SPY = "SPY"
+SYM_VIX = "VIX"   # Se non va col tuo piano/account, il codice usa fallback automatico
 
 ITALY_TZ = ZoneInfo("Europe/Rome")
+NY_TZ = ZoneInfo("America/New_York")
 
 # =========================
 # SESSION HTTP ROBUSTA
@@ -62,8 +79,8 @@ SESSION.mount("https://", adapter)
 SESSION.mount("http://", adapter)
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-    "Accept": "text/html,*/*",
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64)",
+    "Accept": "application/json,text/plain,*/*",
 }
 
 # =========================
@@ -72,17 +89,33 @@ HEADERS = {
 _macro_cache: Dict[str, Any] = {"date": None, "events": []}
 _market_cache: Dict[str, Any] = {"ts": None, "data": None}
 
+
 # =========================
-# FETCH EVENTI MACRO (ForexFactory)
+# TIME HELPERS
 # =========================
 def italy_now() -> datetime:
     return datetime.now(ITALY_TZ)
 
+
+def ny_now() -> datetime:
+    return datetime.now(NY_TZ)
+
+
+def is_us_market_open_now() -> bool:
+    """
+    Mercato cash USA: lun-ven, 09:30-16:00 America/New_York.
+    Serve solo per limitare il job automatico; i comandi manuali restano disponibili sempre.
+    """
+    now = ny_now()
+    if now.weekday() >= 5:
+        return False
+    return time(9, 30) <= now.time() <= time(16, 0)
+
+
+# =========================
+# FETCH EVENTI MACRO (ForexFactory)
+# =========================
 def fetch_macro_events() -> list:
-    """
-    Recupera eventi macro USD (high/medium impact) dal calendario ForexFactory.
-    Risultato cachato per tutta la giornata per non fare troppe richieste.
-    """
     global _macro_cache
 
     today_str = italy_now().strftime("%Y-%m-%d")
@@ -92,8 +125,11 @@ def fetch_macro_events() -> list:
 
     try:
         url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
-        headers = {"User-Agent": "Mozilla/5.0"}
-        r = SESSION.get(url, headers=headers, timeout=(10, 20))
+        r = SESSION.get(
+            url,
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=(10, 20),
+        )
         r.raise_for_status()
         data = r.json()
 
@@ -111,29 +147,30 @@ def fetch_macro_events() -> list:
             try:
                 dt_utc = datetime.strptime(raw_date, "%Y-%m-%dT%H:%M:%S%z")
                 dt_it = dt_utc.astimezone(ITALY_TZ)
-                date_str = dt_it.strftime("%Y-%m-%d")
-                if date_str != today_str:
+                if dt_it.strftime("%Y-%m-%d") != today_str:
                     continue
-
                 time_str = dt_it.strftime("%H:%M")
             except Exception:
                 continue
 
-            events.append({
-                "name": ev.get("title", "Evento USD"),
-                "time": time_str,
-                "impact": ev.get("impact", "").lower(),
-            })
+            events.append(
+                {
+                    "name": ev.get("title", "Evento USD"),
+                    "time": time_str,
+                    "impact": ev.get("impact", "").lower(),
+                }
+            )
 
         events.sort(key=lambda e: e["time"])
         _macro_cache = {"date": today_str, "events": events}
-        print(f"📅 Eventi macro caricati: {len(events)} per oggi ({today_str})")
+        logger.info("📅 Eventi macro caricati: %s per oggi (%s)", len(events), today_str)
         return events
 
     except Exception as e:
-        print(f"❌ Errore fetch eventi macro: {e}")
+        logger.exception("❌ Errore fetch eventi macro: %s", e)
         _macro_cache = {"date": today_str, "events": []}
         return []
+
 
 def parse_event_time(hhmm: str) -> Optional[datetime]:
     try:
@@ -143,15 +180,13 @@ def parse_event_time(hhmm: str) -> Optional[datetime]:
     except Exception:
         return None
 
-def next_event_within(minutes: int = 15):
-    events = fetch_macro_events()
-    now = italy_now()
 
-    for ev in events:
+def next_event_within(minutes: int = 15):
+    now = italy_now()
+    for ev in fetch_macro_events():
         dt = parse_event_time(ev["time"])
         if not dt:
             continue
-
         delta = (dt - now).total_seconds() / 60
         if 0 <= delta <= minutes:
             return {
@@ -160,8 +195,8 @@ def next_event_within(minutes: int = 15):
                 "minutes": int(round(delta)),
                 "impact": ev.get("impact", ""),
             }
-
     return None
+
 
 def format_events_list() -> str:
     events = fetch_macro_events()
@@ -169,79 +204,92 @@ def format_events_list() -> str:
         return "Nessun evento macro USD oggi"
 
     icon = {"high": "🔴", "medium": "🟡"}
-    lines = []
-    for ev in events:
-        i = icon.get(ev.get("impact", ""), "⚪")
-        lines.append(f"{i} {ev['time']} — {ev['name']}")
-    return "\n".join(lines)
+    return "\n".join(
+        f"{icon.get(ev.get('impact', ''), '⚪')} {ev['time']} — {ev['name']}"
+        for ev in events
+    )
+
 
 # =========================
-# FETCH DA STOOQ
+# TWELVEDATA
 # =========================
-def stooq_quote(symbol: str) -> Dict[str, float]:
-    url = "https://stooq.com/q/l/"
-    params = {"s": symbol, "f": "sd2t2ohlcv", "h": "", "e": "csv"}
+def td_get(endpoint: str, params: dict) -> dict:
+    """
+    Chiamata generica a TwelveData con auth via header Authorization: apikey ...
+    """
+    headers = dict(HEADERS)
+    headers["Authorization"] = f"apikey {TWELVEDATA_API_KEY}"
 
     try:
-        r = SESSION.get(url, params=params, headers=HEADERS, timeout=(30, 60))
+        r = SESSION.get(
+            f"https://api.twelvedata.com/{endpoint}",
+            params=params,
+            headers=headers,
+            timeout=(15, 30),
+        )
         r.raise_for_status()
+        data = r.json()
     except requests.exceptions.RequestException as e:
-        print(f"❌ Errore Stooq quote [{symbol}] -> {e}")
-        raise RuntimeError(f"Errore rete Stooq ({symbol}): {e}")
+        logger.exception("❌ Errore rete TwelveData [%s]: %s", endpoint, e)
+        raise RuntimeError(f"Errore rete TwelveData: {e}")
 
-    reader = csv.DictReader(io.StringIO(r.text))
-    rows = list(reader)
-    if not rows:
-        raise RuntimeError(f"Nessun dato Stooq per {symbol}")
+    if isinstance(data, dict) and data.get("status") == "error":
+        msg = data.get("message", "errore sconosciuto")
+        logger.error("❌ Errore TwelveData [%s]: %s", endpoint, msg)
+        raise RuntimeError(f"Errore TwelveData: {msg}")
 
-    row = rows[0]
+    return data
 
-    def safe(val, fallback=None):
-        try:
-            v = (val or "").strip()
-            return float(v) if v not in ("N/D", "", "-", "N/A") else fallback
-        except Exception:
+
+def _safe_float(v, fallback=None):
+    try:
+        if v in (None, "", "N/A"):
             return fallback
+        return float(v)
+    except Exception:
+        return fallback
 
+
+def td_quote(symbol: str) -> Dict[str, float]:
+    data = td_get("quote", {"symbol": symbol})
     return {
-        "open": safe(row.get("Open", "N/D")),
-        "high": safe(row.get("High", "N/D")),
-        "low": safe(row.get("Low", "N/D")),
-        "close": safe(row.get("Close", "N/D")),
-        "volume": safe(row.get("Volume", "N/D"), 0.0),
+        "open": _safe_float(data.get("open")),
+        "high": _safe_float(data.get("high")),
+        "low": _safe_float(data.get("low")),
+        "close": _safe_float(data.get("close")),
+        "volume": _safe_float(data.get("volume"), 0.0),
     }
 
-def stooq_history(symbol: str, days: int = 5) -> list:
-    url = "https://stooq.com/q/d/l/"
-    params = {"s": symbol, "i": "d"}
 
-    try:
-        r = SESSION.get(url, params=params, headers=HEADERS, timeout=(30, 60))
-        r.raise_for_status()
-    except requests.exceptions.RequestException as e:
-        print(f"❌ Errore Stooq history [{symbol}] -> {e}")
-        raise RuntimeError(f"Errore storico Stooq ({symbol}): {e}")
+def td_history(symbol: str, outputsize: int = 5) -> list:
+    data = td_get(
+        "time_series",
+        {
+            "symbol": symbol,
+            "interval": "1day",
+            "outputsize": outputsize,
+            "order": "ASC",
+        },
+    )
 
-    reader = csv.DictReader(io.StringIO(r.text))
-    rows = list(reader)
-    if not rows:
-        raise RuntimeError(f"Storico Stooq vuoto per {symbol}")
-
-    result = []
-    for row in rows[-days:]:
+    out = []
+    for row in data.get("values", []):
         try:
-            result.append({
-                "date": row.get("Date", ""),
-                "open": float(row["Open"]),
-                "high": float(row["High"]),
-                "low": float(row["Low"]),
-                "close": float(row["Close"]),
-                "volume": float(row.get("Volume", 0) or 0),
-            })
+            out.append(
+                {
+                    "date": row.get("datetime", ""),
+                    "open": float(row["open"]),
+                    "high": float(row["high"]),
+                    "low": float(row["low"]),
+                    "close": float(row["close"]),
+                    "volume": float(row.get("volume", 0) or 0),
+                }
+            )
         except Exception:
             continue
 
-    return result
+    return out
+
 
 # =========================
 # SNAPSHOT MERCATO
@@ -256,24 +304,19 @@ def fetch_market_snapshot() -> Dict[str, Any]:
         if age < MARKET_CACHE_SECONDS:
             return _market_cache["data"]
 
-    now_str = now_dt.strftime("%Y-%m-%d %H:%M:%S")
+    spy = td_quote(SYM_SPY)
 
-    # SPY quote: fondamentale
-    spy = stooq_quote(SYM_SPY)
-
-    # History: se fallisce, fallback
     try:
-        spy_hist = stooq_history(SYM_SPY, days=5)
+        spy_hist = td_history(SYM_SPY, outputsize=5)
     except Exception as e:
-        print(f"⚠️ History SPY non disponibile -> {e}")
+        logger.warning("⚠️ Storico SPY non disponibile -> %s", e)
         spy_hist = []
 
-    # VIX: se fallisce, fallback
+    # Se VIX non è disponibile, non blocchiamo tutto
     try:
-        vix_data = stooq_quote(SYM_VIX)
-        vix = vix_data.get("close") or 18.0
+        vix = td_quote(SYM_VIX).get("close") or 18.0
     except Exception as e:
-        print(f"⚠️ VIX non disponibile, uso fallback 18.0 -> {e}")
+        logger.warning("⚠️ VIX non disponibile, uso fallback 18.0 -> %s", e)
         vix = 18.0
 
     price = spy.get("close")
@@ -281,10 +324,7 @@ def fetch_market_snapshot() -> Dict[str, Any]:
         raise RuntimeError(
             "⚠️ Prezzo non disponibile.\n"
             "Il mercato USA potrebbe essere chiuso\n"
-            "(weekend, festivi) oppure Stooq non ha\n"
-            "ancora aggiornato i dati.\n"
-            "Riprova durante gli orari di borsa USA\n"
-            "(15:30–22:00 ora italiana)."
+            "(weekend, festivi) oppure TwelveData non ha ancora aggiornato i dati."
         )
 
     open_ = spy.get("open") or price
@@ -300,7 +340,7 @@ def fetch_market_snapshot() -> Dict[str, Any]:
         prev_close = open_
 
     result = {
-        "timestamp": now_str,
+        "timestamp": now_dt.strftime("%Y-%m-%d %H:%M:%S"),
         "price": price,
         "open": open_,
         "prev_close": prev_close,
@@ -320,6 +360,7 @@ def fetch_market_snapshot() -> Dict[str, Any]:
 def clamp(v, lo=0, hi=100):
     return max(lo, min(hi, int(round(v))))
 
+
 def label_from_score(s):
     if s <= 20:
         return "molto debole"
@@ -330,6 +371,7 @@ def label_from_score(s):
     if s <= 75:
         return "forte"
     return "molto forte"
+
 
 def compute_argo(snapshot: Dict[str, Any]) -> Dict[str, Any]:
     price = snapshot["price"]
@@ -415,7 +457,6 @@ def compute_argo(snapshot: Dict[str, Any]) -> Dict[str, Any]:
 
     if bull_trigger:
         bullish += 15
-
     if bear_trigger:
         bearish += 15
 
@@ -463,11 +504,13 @@ def compute_argo(snapshot: Dict[str, Any]) -> Dict[str, Any]:
         "next_event": next_ev,
     }
 
+
 # =========================
 # FORMATTERS
 # =========================
 def _impact_icon(impact: str) -> str:
     return {"high": "🔴", "medium": "🟡"}.get(impact, "⚪")
+
 
 def format_status(d):
     ev_row = ""
@@ -492,6 +535,7 @@ def format_status(d):
         f"{ev_row}\n\n"
         f"Aggiornato: {d['timestamp']}"
     )
+
 
 def format_postit(d):
     ev_row = ""
@@ -519,6 +563,7 @@ def format_postit(d):
         f"{ev_row}"
     )
 
+
 def format_briefing(d):
     return (
         f"🧭 ARGO BRIEFING\n\n"
@@ -541,6 +586,7 @@ def format_briefing(d):
         f"📅 EVENTI MACRO OGGI\n{format_events_list()}"
     )
 
+
 def build_alert(last, current):
     if last is None:
         return None
@@ -561,10 +607,7 @@ def build_alert(last, current):
         return f"🚨 DETERIORAMENTO — rotto {current['down_break']}  Prezzo: {current['price']}"
 
     if last.get("price", 999999) >= last.get("structural_break", 999999) and current["price"] < current["structural_break"]:
-        return (
-            f"🚨 BREAK STRUTTURALE — violato {current['structural_break']} "
-            f"Prezzo: {current['price']}"
-        )
+        return f"🚨 BREAK STRUTTURALE — violato {current['structural_break']} Prezzo: {current['price']}"
 
     ev = current.get("next_event")
     if ev:
@@ -582,6 +625,7 @@ def build_alert(last, current):
 
     return None
 
+
 # =========================
 # ASYNC
 # =========================
@@ -589,10 +633,12 @@ async def analyze_now():
     snap = await asyncio.to_thread(fetch_market_snapshot)
     return compute_argo(snap)
 
+
 # =========================
 # COMANDI TELEGRAM
 # =========================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.info("📩 /start ricevuto da chat_id=%s", update.effective_chat.id)
     await update.message.reply_text(
         "✅ ARGO Bot attivo!\n\n"
         "/status   — snapshot\n"
@@ -604,8 +650,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/ping     — test rapido"
     )
 
+
 async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.info("📩 /ping ricevuto da chat_id=%s", update.effective_chat.id)
     await update.message.reply_text("pong 🟢")
+
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⏳ Recupero dati…")
@@ -613,8 +662,9 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         result = await analyze_now()
         await update.message.reply_text(format_status(result))
     except Exception as e:
-        print(f"❌ Errore /status: {e}")
+        logger.exception("❌ Errore /status: %s", e)
         await update.message.reply_text(f"❌ {e}")
+
 
 async def briefing(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⏳ Elaboro briefing…")
@@ -622,8 +672,9 @@ async def briefing(update: Update, context: ContextTypes.DEFAULT_TYPE):
         result = await analyze_now()
         await update.message.reply_text(format_briefing(result))
     except Exception as e:
-        print(f"❌ Errore /briefing: {e}")
+        logger.exception("❌ Errore /briefing: %s", e)
         await update.message.reply_text(f"❌ {e}")
+
 
 async def postit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⏳ Recupero livelli…")
@@ -631,8 +682,9 @@ async def postit(update: Update, context: ContextTypes.DEFAULT_TYPE):
         result = await analyze_now()
         await update.message.reply_text(format_postit(result))
     except Exception as e:
-        print(f"❌ Errore /postit: {e}")
+        logger.exception("❌ Errore /postit: %s", e)
         await update.message.reply_text(f"❌ {e}")
+
 
 async def eventi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -647,21 +699,23 @@ async def eventi(update: Update, context: ContextTypes.DEFAULT_TYPE):
         icon = {"high": "🔴", "medium": "🟡"}
         lines = ["📅 EVENTI MACRO USD OGGI\n"]
         for ev in evs:
-            i = icon.get(ev.get("impact", ""), "⚪")
-            lines.append(f"{i} {ev['time']} — {ev['name']}")
+            lines.append(f"{icon.get(ev.get('impact', ''), '⚪')} {ev['time']} — {ev['name']}")
 
         await update.message.reply_text("\n".join(lines))
     except Exception as e:
-        print(f"❌ Errore /eventi: {e}")
+        logger.exception("❌ Errore /eventi: %s", e)
         await update.message.reply_text(f"❌ Errore eventi: {e}")
+
 
 async def watchon(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.application.bot_data.setdefault("watch_chats", set()).add(update.effective_chat.id)
     await update.message.reply_text(f"✅ Watch ON — controllo ogni {UPDATE_INTERVAL_SECONDS}s")
 
+
 async def watchoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.application.bot_data.setdefault("watch_chats", set()).discard(update.effective_chat.id)
     await update.message.reply_text("⏸️ Watch OFF")
+
 
 # =========================
 # JOB AUTOMATICO
@@ -670,6 +724,10 @@ async def market_job(context: ContextTypes.DEFAULT_TYPE):
     app = context.application
     try:
         if not app.bot_data.get("watch_chats"):
+            return
+
+        # Evita consumo crediti quando il mercato è chiuso
+        if not is_us_market_open_now():
             return
 
         current = await analyze_now()
@@ -681,29 +739,57 @@ async def market_job(context: ContextTypes.DEFAULT_TYPE):
                 try:
                     await app.bot.send_message(chat_id=cid, text=alert)
                 except Exception as e:
-                    print(f"❌ Errore invio alert a {cid}: {e}")
+                    logger.exception("❌ Errore invio alert a %s: %s", cid, e)
 
     except Exception as e:
-        print(f"❌ Errore market_job: {e}")
+        logger.exception("❌ Errore market_job: %s", e)
+
 
 async def post_init(app):
+    logger.info("🚀 post_init avviato")
+
     app.bot_data.setdefault("watch_chats", set())
     app.bot_data.setdefault("last_global_state", None)
 
-    # precarica eventi macro all'avvio
-    await asyncio.to_thread(fetch_macro_events)
+    try:
+        me = await app.bot.get_me()
+        logger.info("✅ Bot Telegram connesso: @%s (id=%s)", me.username, me.id)
+    except Exception as e:
+        logger.exception("❌ Errore get_me in post_init: %s", e)
 
-    app.job_queue.run_repeating(
-        market_job,
-        interval=UPDATE_INTERVAL_SECONDS,
-        first=UPDATE_INTERVAL_SECONDS,
-    )
-    print("✅ Job ARGO avviato")
+    try:
+        await app.bot.delete_webhook(drop_pending_updates=True)
+        logger.info("✅ Webhook rimosso / polling pronto")
+    except Exception as e:
+        logger.exception("❌ Errore delete_webhook: %s", e)
+
+    try:
+        await asyncio.to_thread(fetch_macro_events)
+        logger.info("✅ Eventi macro precaricati")
+    except Exception as e:
+        logger.exception("⚠️ Errore preload eventi macro: %s", e)
+
+    try:
+        app.job_queue.run_repeating(
+            market_job,
+            interval=UPDATE_INTERVAL_SECONDS,
+            first=UPDATE_INTERVAL_SECONDS,
+        )
+        logger.info("✅ Job ARGO avviato")
+    except Exception as e:
+        logger.exception("❌ Errore avvio job queue: %s", e)
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.exception("❌ Eccezione non gestita:", exc_info=context.error)
+
 
 # =========================
 # MAIN
 # =========================
 def main():
+    logger.info("🟢 Avvio ARGO bot...")
+
     app = (
         ApplicationBuilder()
         .token(TOKEN)
@@ -729,14 +815,19 @@ def main():
     for cmd, fn in handlers:
         app.add_handler(CommandHandler(cmd, fn))
 
+    app.add_error_handler(error_handler)
+
     threading.Thread(target=run_web_server, daemon=True).start()
 
-    print("🤖 Bot ARGO partito…")
+    logger.info("🤖 Bot ARGO partito… entro in polling")
+
     app.run_polling(
         poll_interval=1.0,
         timeout=30,
         drop_pending_updates=True,
+        allowed_updates=Update.ALL_TYPES,
     )
+
 
 if __name__ == "__main__":
     main()
