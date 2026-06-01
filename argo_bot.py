@@ -1,3 +1,4 @@
+import yfinance as yf
 import asyncio
 import logging
 import os
@@ -291,10 +292,11 @@ def td_history(symbol: str, outputsize: int = 5) -> list:
 # =========================
 # YAHOO FINANCE (VIX SPOT)
 # =========================
+
 def get_vix_spot(force_refresh: bool = False) -> float:
     """
-    Legge il vero VIX spot da Yahoo Finance (^VIX).
-    Tiene una piccola cache per evitare richieste inutili ravvicinate.
+    Legge il VIX spot da Yahoo Finance tramite yfinance.
+    Tiene una piccola cache per evitare richieste ravvicinate.
     """
     global _vix_cache
 
@@ -304,39 +306,40 @@ def get_vix_spot(force_refresh: bool = False) -> float:
         if age < MARKET_CACHE_SECONDS:
             return float(_vix_cache["value"])
 
-    url = "https://query1.finance.yahoo.com/v7/finance/quote"
-    params = {"symbols": "^VIX"}
-
-    headers = dict(HEADERS)
-    headers["User-Agent"] = "Mozilla/5.0"
-
     try:
-        r = SESSION.get(url, params=params, headers=headers, timeout=(10, 20))
-        r.raise_for_status()
-        data = r.json()
-    except requests.exceptions.RequestException as e:
-        logger.exception("❌ Errore rete Yahoo VIX: %s", e)
-        raise RuntimeError(f"Errore rete Yahoo Finance VIX: {e}")
+        ticker = yf.Ticker("^VIX")
 
-    try:
-        result = data["quoteResponse"]["result"]
-        if not result:
-            raise RuntimeError("Risposta Yahoo vuota per ^VIX")
+        # Primo tentativo: fast_info
+        price = None
+        try:
+            fi = getattr(ticker, "fast_info", None)
+            if fi:
+                price = fi.get("lastPrice") or fi.get("last_price")
+        except Exception:
+            pass
 
-        quote = result[0]
-        price = quote.get("regularMarketPrice")
+        # Fallback: history intraday breve
+        if price in (None, "", "N/A"):
+            hist = ticker.history(period="1d", interval="1m")
+            if hist is not None and not hist.empty:
+                price = float(hist["Close"].dropna().iloc[-1])
+
+        # Fallback finale: history giornaliera
+        if price in (None, "", "N/A"):
+            hist = ticker.history(period="5d", interval="1d")
+            if hist is not None and not hist.empty:
+                price = float(hist["Close"].dropna().iloc[-1])
 
         if price in (None, "", "N/A"):
-            raise RuntimeError("Prezzo VIX non disponibile su Yahoo")
+            raise RuntimeError("Prezzo VIX non disponibile da yfinance")
 
         value = float(price)
         _vix_cache = {"ts": now_dt, "value": value}
         return value
 
     except Exception as e:
-        logger.exception("❌ Errore parsing Yahoo VIX: %s", e)
-        raise RuntimeError(f"Errore parsing Yahoo Finance VIX: {e}")
-
+        logger.exception("❌ Errore yfinance VIX: %s", e)
+        raise RuntimeError(f"Errore Yahoo/yfinance VIX: {e}")
 
 # =========================
 # SNAPSHOT MERCATO
